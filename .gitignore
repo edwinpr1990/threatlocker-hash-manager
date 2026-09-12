@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+runs/
+.streamlit/secrets.toml
+.build-venv/
+build/
+dist/
+release/
+*.spec
+*.log
+*.sqlite3*
+*.zip
+.env*
