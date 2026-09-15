@@ -1,4 +1,4 @@
-"""Frozen Windows entry point. Starts only a localhost dashboard, never a deletion."""
+"""Frozen Windows entry point. GUI by default; explicit --worker for headless CLI."""
 import argparse
 import os
 from pathlib import Path
@@ -11,10 +11,6 @@ import webbrowser
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--port', type=int, default=8511)
-    parser.add_argument('--no-browser', action='store_true')
-    args = parser.parse_args()
     root = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
     data = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'ThreatLockerHashManager'
     data.mkdir(parents=True, exist_ok=True)
@@ -24,6 +20,14 @@ def main():
         sys.stdout = (data / 'startup.log').open('a', encoding='utf-8', buffering=1)
     if sys.stderr is None:
         sys.stderr = sys.stdout
+    if len(sys.argv)>1 and sys.argv[1]=='--worker':
+        import cli as worker
+        sys.argv=[sys.argv[0],*sys.argv[2:]]
+        return worker.main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--port', type=int, default=8511)
+    parser.add_argument('--no-browser', action='store_true')
+    args = parser.parse_args()
     with socket.socket() as probe:
         try:
             probe.bind(('127.0.0.1', args.port))

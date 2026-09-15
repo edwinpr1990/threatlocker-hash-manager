@@ -9,12 +9,15 @@ import csv
 import hashlib
 import json
 import re
+import os
 import sqlite3
 import threading
 import time
+import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from contextlib import closing
+from contextlib import closing, contextmanager
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,6 +42,8 @@ class Settings:
     mode: str = 'Selective'
     page_size: int = 1000
     timeout: int = 60
+    batch_size: int = 256
+    verification_mode: str = 'Auto'
 
     def validate(self):
         try:
@@ -55,6 +60,8 @@ class Settings:
             raise SafetyError('Invalid worker count or page size.')
         if self.mode not in ('Selective', 'Bulk') or not 10 <= self.timeout <= 120:
             raise SafetyError('Invalid lookup mode or timeout.')
+        if not 1 <= self.batch_size <= 1000 or self.verification_mode not in ('Auto', 'Selective', 'Bulk'):
+            raise SafetyError('Invalid batch size or verification mode.')
 
     @property
     def base(self):
@@ -72,6 +79,41 @@ class Client:
         self.local = threading.local()
         self.sessions = []
         self.lock = threading.Lock()
+        self.gate = threading.Condition()
+        self.inflight = 0
+        self.capacity = settings.workers
+        self.cooldown_until = 0.0
+        self.throttles = 0
+
+    @contextmanager
+    def slot(self):
+        with self.gate:
+            while self.inflight >= self.capacity or time.monotonic() < self.cooldown_until:
+                self.gate.wait(timeout=min(1,max(0.01,self.cooldown_until-time.monotonic())))
+            self.inflight += 1
+        try:
+            yield
+        finally:
+            with self.gate:
+                self.inflight -= 1
+                self.gate.notify_all()
+
+    def throttle(self, response):
+        if response.status_code != 429:
+            return
+        raw = response.headers.get('Retry-After','2')
+        try:
+            delay = float(raw)
+        except ValueError:
+            try:
+                delay = parsedate_to_datetime(raw).timestamp()-time.time()
+            except (ValueError,TypeError,OverflowError):
+                delay = 2
+        with self.gate:
+            self.throttles += 1
+            self.capacity = max(1,self.capacity//2)
+            self.cooldown_until = max(self.cooldown_until,time.monotonic()+max(1,delay))
+            self.gate.notify_all()
 
     def session(self):
         if not hasattr(self.local, 'session'):
@@ -95,8 +137,10 @@ class Client:
     def get(self, endpoint, params):
         for attempt in range(4):
             try:
-                r = self.session().get(self.cfg.base + endpoint, params=params,
-                                       timeout=(10, self.cfg.timeout), allow_redirects=False)
+                with self.slot():
+                    r = self.session().get(self.cfg.base + endpoint, params=params,
+                                           timeout=(10, self.cfg.timeout), allow_redirects=False)
+                    self.throttle(r)
             except requests.RequestException:
                 if attempt == 3:
                     raise SafetyError('GET failed after retries (network/timeout).') from None
@@ -131,9 +175,10 @@ class Client:
     def files(self, app_id, search='', cancelled=lambda: False):
         size = self.cfg.page_size if not search else 100
         page = 1
-        # Page fingerprints bound memory by number of pages, not application size.
-        seen_pages = set()
-        while True:
+        # Disk-backed cross-page uniqueness detection catches partial overlaps too.
+        with tempfile.TemporaryDirectory(prefix='tl-pages-') as tmp, closing(sqlite3.connect(str(Path(tmp)/'seen.db'))) as seen:
+          seen.execute('CREATE TABLE seen(fid TEXT PRIMARY KEY)')
+          while True:
             if cancelled():
                 raise Cancelled()
             rows = self.get('/ApplicationFile/ApplicationFileGetByApplicationId', {
@@ -149,19 +194,22 @@ class Client:
                 if row.get('applicationId') and str(row['applicationId']).lower() != app_id:
                     raise SafetyError('Returned file belongs to another application; blocked.')
                 ids.append(str(row['applicationFileId']))
-            fingerprint = hashlib.sha256('\0'.join(ids).encode()).digest()
-            if rows and (fingerprint in seen_pages or len(ids) != len(set(ids))):
-                raise SafetyError('Repeated page or file ID; blocked.')
-            seen_pages.add(fingerprint)
+            try:
+                seen.executemany('INSERT INTO seen VALUES (?)', ((fid,) for fid in ids))
+            except sqlite3.IntegrityError:
+                raise SafetyError('Repeated page or file ID; blocked.') from None
             yield from rows
-            if len(rows) < size:
+            # Require an empty terminal page, not merely a short server-capped page.
+            if not rows:
                 break
             page += 1
 
     def delete(self, body):
         try:
-            r = self.session().post(self.cfg.base + '/ApplicationFile/ApplicationFileDeleteById',
-                                    json=body, timeout=(10, self.cfg.timeout), allow_redirects=False)
+            with self.slot():
+                r = self.session().post(self.cfg.base + '/ApplicationFile/ApplicationFileDeleteById',
+                                        json=body, timeout=(10, self.cfg.timeout), allow_redirects=False)
+                self.throttle(r)
             return 200 <= r.status_code < 300, f'HTTP {r.status_code}'
         except requests.RequestException:
             return False, 'Network/timeout; outcome unknown (not retried)'
@@ -173,6 +221,40 @@ def connect(path):
     db.execute('PRAGMA journal_mode=WAL')
     db.execute('PRAGMA synchronous=FULL')
     return db
+
+
+@contextmanager
+def application_locks(cfg, applications):
+    """OS releases these locks on process exit; coordinates CLI and dashboard."""
+    root = Path(os.environ.get('LOCALAPPDATA', tempfile.gettempdir()))/'ThreatLockerHashManager'/'locks'
+    root.mkdir(parents=True,exist_ok=True)
+    handles=[]
+    try:
+        for app in sorted(applications):
+            name=hashlib.sha256(f'{cfg.org.lower()}:{cfg.instance}:{app}'.encode()).hexdigest()
+            f=(root/(name+'.lock')).open('a+b')
+            if f.tell()==0:
+                f.write(b'0');f.flush()
+            f.seek(0)
+            try:
+                if os.name=='nt':
+                    import msvcrt
+                    msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1)
+                else:
+                    import fcntl
+                    fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except OSError:
+                f.close()
+                raise SafetyError('Another local worker holds this application lock.') from None
+            handles.append(f)
+        yield
+    finally:
+        for f in handles:
+            f.seek(0)
+            if os.name=='nt':
+                import msvcrt
+                msvcrt.locking(f.fileno(),msvcrt.LK_UNLCK,1)
+            f.close()
 
 
 def initialize(db):
@@ -188,6 +270,8 @@ def initialize(db):
             PRIMARY KEY(app,fid));
         CREATE INDEX IF NOT EXISTS target_hash ON targets(app,hash);
         CREATE TABLE IF NOT EXISTS matched(app TEXT, hash TEXT, PRIMARY KEY(app,hash));
+        CREATE TABLE IF NOT EXISTS run_meta(key TEXT PRIMARY KEY, value TEXT);
+        CREATE INDEX IF NOT EXISTS target_status ON targets(status);
     ''')
 
 
@@ -289,7 +373,7 @@ class Job:
     def active(self):
         return self.thread is not None and self.thread.is_alive()
 
-    def start(self, execute=False):
+    def start(self, execute=False, recover=False):
         if self.active:
             raise SafetyError('A job is already running.')
         if execute and (self.phase != 'Ready' or time.time() - self.prepared_at > 1800):
@@ -297,16 +381,44 @@ class Job:
         self.stop.clear()
         self.started = time.time()
         self.finished = None
-        self.thread = threading.Thread(target=self._run, args=(execute,), daemon=True)
+        if execute and recover:
+            raise SafetyError('Recovery requires a new preview before execution.')
+        self.thread = threading.Thread(target=self._run, args=(execute, recover), daemon=True)
         self.thread.start()
 
-    def _run(self, execute):
+    @classmethod
+    def restore(cls, cfg, directory, client_factory=Client):
+        path = Path(directory)/'audit.sqlite3'
+        if not path.is_file():
+            raise SafetyError('No audit database in the selected run.')
+        with closing(connect(path)) as db:
+            try:
+                saved = db.execute("SELECT value FROM run_meta WHERE key='scope'").fetchone()
+            except sqlite3.OperationalError:
+                raise SafetyError('Legacy or invalid audit database. Build a fresh dry run for v1 audits.') from None
+            if not saved or json.loads(saved[0]) != [cfg.org.lower(), cfg.instance, cfg.user_instance]:
+                raise SafetyError('Recovery organization/instance does not match the saved run.')
+        job = cls(cfg, directory, client_factory)
+        job.update('Recovery required', 'Reconcile saved records before confirming a new deletion plan.')
+        return job
+
+    def _run(self, execute, recover=False):
         client = self.client_factory(self.cfg)
         db = connect(self.path)
         try:
             initialize(db)
-            if execute:
-                self.execute(db, client)
+            scope = json.dumps([self.cfg.org.lower(), self.cfg.instance, self.cfg.user_instance])
+            db.execute("INSERT OR IGNORE INTO run_meta VALUES ('scope',?)", (scope,))
+            db.commit()
+            if recover:
+                with application_locks(self.cfg,[r[0] for r in db.execute('SELECT app FROM applications')]):
+                    self.reconcile(db, client, recovery=True)
+                self.prepared_at = time.time()
+                planned = db.execute("SELECT COUNT(*) FROM targets WHERE status='Planned'").fetchone()[0]
+                self.update('Ready', 'Recovery complete. Existing targets were revalidated; confirm the remaining plan.', planned=planned)
+            elif execute:
+                with application_locks(self.cfg,[r[0] for r in db.execute('SELECT app FROM applications')]):
+                    self.execute(db, client)
             else:
                 self.prepare(db, client)
         except Cancelled:
@@ -316,6 +428,7 @@ class Job:
             message = str(e) if isinstance(e, SafetyError) else f'{type(e).__name__}; inspect local inputs or contact support.'
             self.update('Failed', message)
         finally:
+            self.update(throttles=getattr(client,'throttles',0),effective_workers=getattr(client,'capacity',self.cfg.workers))
             db.commit()
             db.close()
             client.close()
@@ -323,6 +436,7 @@ class Job:
             self.export()
 
     def prepare(self, db, client):
+        preparation_start = time.perf_counter()
         self.update('Validating', 'Importing CSV into the disk-backed plan.')
         count, duplicates = import_csv(db, self.directory / 'input.csv', self.stop.is_set)
         self.update(rows=count, duplicates=duplicates, requested=count-duplicates)
@@ -349,10 +463,12 @@ class Job:
             matches = hashes(row) & requested_hashes
             if not matches:
                 return
+            if row.get('applicationId') and str(row['applicationId']).lower() != app_id:
+                raise SafetyError('Target application mismatch.')
             for h in matches:
                 db.execute('INSERT OR IGNORE INTO matched VALUES (?,?)', (app_id, h))
             app = metadata[app_id]
-            body = dict(row, osType=app['osType'], applicationName=app.get('name', ''), organizationId=self.cfg.org)
+            body = dict(row, applicationId=app_id, osType=app['osType'], applicationName=app.get('name', ''), organizationId=self.cfg.org)
             db.execute('INSERT OR IGNORE INTO targets(app,fid,hash,body) VALUES (?,?,?,?)',
                        (app_id, str(row['applicationFileId']), sorted(matches)[0], json.dumps(body)))
 
@@ -360,13 +476,24 @@ class Job:
             app_id = group['app']
             self.update(message=f'{self.cfg.mode} lookup: {app_id}')
             if self.cfg.mode == 'Bulk':
+                db.execute('CREATE TEMP TABLE IF NOT EXISTS page_hashes(hash TEXT PRIMARY KEY)')
+                def match_page(page):
+                    db.execute('DELETE FROM page_hashes')
+                    db.executemany('INSERT OR IGNORE INTO page_hashes VALUES (?)',
+                                   ((h,) for row in page for h in hashes(row)))
+                    wanted = {r[0] for r in db.execute('SELECT p.hash FROM page_hashes p JOIN requested r ON r.hash=p.hash AND r.app=?', (app_id,))}
+                    for row in page:
+                        add(app_id, row, wanted)
+                    db.commit()
+                    self.update(scanned=scanned)
+                page = []
                 for row in client.files(app_id, cancelled=self.stop.is_set):
-                    hs = hashes(row)
-                    wanted = {h for h in hs if db.execute('SELECT 1 FROM requested WHERE app=? AND hash=?', (app_id, h)).fetchone()}
-                    add(app_id, row, wanted)
-                    if scanned % 1000 == 0:
-                        db.commit()
-                        self.update(scanned=scanned, planned=db.execute('SELECT COUNT(*) FROM targets').fetchone()[0])
+                    page.append(row)
+                    if len(page) >= self.cfg.page_size:
+                        match_page(page)
+                        page = []
+                if page:
+                    match_page(page)
             else:
                 def lookup(h):
                     return h, list(client.files(app_id, h, self.stop.is_set))
@@ -383,7 +510,8 @@ class Job:
         unmatched = db.execute('SELECT COUNT(*) FROM requested r WHERE NOT EXISTS (SELECT 1 FROM matched m WHERE m.app=r.app AND m.hash=r.hash)').fetchone()[0]
         self.prepared_at = time.time()
         self.update('Ready', 'Dry run complete. No deletions sent. Review the exact record count before confirming.',
-                    planned=planned, unmatched=unmatched, scanned=scanned)
+                    planned=planned, unmatched=unmatched, scanned=scanned,
+                    preparation_seconds=round(time.perf_counter()-preparation_start, 2))
 
     def execute(self, db, client):
         self.update('Revalidating', 'Rechecking application ownership and OS before deletion.')
@@ -393,20 +521,25 @@ class Job:
             raise Cancelled()
         self.update('Deleting', 'Stop prevents new requests; in-flight requests finish and are verified.', sent=0, accepted=0)
         total = accepted = 0
+        initial_remaining = db.execute("SELECT COUNT(*) FROM targets WHERE status='Planned'").fetchone()[0]
+        commits = 0
 
         def source():
+            nonlocal commits
             # Keyset paging avoids loading the plan or an unbounded Future list.
             last = 0
             while not self.stop.is_set():
-                batch = db.execute("SELECT rowid,* FROM targets WHERE rowid>? AND status='Planned' ORDER BY rowid LIMIT 100", (last,)).fetchall()
+                batch = db.execute("SELECT rowid,* FROM targets WHERE rowid>? AND status='Planned' ORDER BY rowid LIMIT ?", (last, self.cfg.batch_size)).fetchall()
                 if not batch:
                     break
+                db.executemany("UPDATE targets SET status='Reserved' WHERE rowid=?", ((r['rowid'],) for r in batch))
+                db.commit()  # Entire group's intent is durable BEFORE any of its POSTs.
+                commits += 1
                 for row in batch:
                     if self.stop.is_set():
                         return
                     last = row['rowid']
                     db.execute("UPDATE targets SET status='Dispatched' WHERE rowid=?", (last,))
-                    db.commit()  # Durable intent before POST; never auto-resume uncertain writes.
                     yield dict(row)
 
         def remove(row):
@@ -419,39 +552,73 @@ class Job:
             accepted += ok
             db.execute('UPDATE targets SET status=?,detail=? WHERE rowid=?',
                        ('Accepted' if ok else 'Uncertain', detail, rowid))
-            db.commit()
+            if total % self.cfg.batch_size == 0:
+                db.commit()
+                commits += 1
             self.update(sent=total, accepted=accepted)
             if not ok:
                 self.stop.set()  # Fail closed on throttling, auth errors, or ambiguous POSTs.
-        self.update(deletion_seconds=round(time.perf_counter()-delete_start, 2))
+        # Reserved records not yielded in this process were never submitted.
+        db.execute("UPDATE targets SET status='Planned' WHERE status='Reserved'")
+        db.commit()
+        commits += 1
+        self.update(deletion_seconds=round(time.perf_counter()-delete_start, 2), deletion_commits=commits)
         self.update('Verifying', 'Checking dispatched file IDs. No POST retries are performed.')
         verify_start = time.perf_counter()
-        # Stopping deletion still reconciles its bounded set of dispatched writes.
+        self.reconcile(db, client)
+        verified = db.execute("SELECT COUNT(*) FROM targets WHERE status='VerifiedAbsent'").fetchone()[0]
+        remaining = db.execute("SELECT COUNT(*) FROM targets WHERE status!='VerifiedAbsent'").fetchone()[0]
+        complete = remaining == 0
+        self.update('Complete' if complete else 'Stopped / review required',
+                    'All planned file IDs verified absent.' if complete else 'Some targets remain or were not attempted. Recover the run to revalidate and continue.',
+                    verified=verified, verification_seconds=round(time.perf_counter()-verify_start, 2))
+
+    def reconcile(self, db, client, recovery=False):
+        """Read-only remote reconciliation. Recovery updates bodies and never sends POSTs."""
+        if recovery:
+            self.update('Recovering', 'Revalidating saved record IDs against their original applications.')
+        eligible = ('Planned','Reserved','Dispatched','Accepted','Uncertain','StillPresent') if recovery else ('Accepted','Uncertain','Dispatched')
+        placeholders = ','.join('?' for _ in eligible)
+        verification_modes = {}
         for app in db.execute('SELECT * FROM applications').fetchall():
             app_id = app['app']
-            if not db.execute("SELECT 1 FROM targets WHERE app=? AND status IN ('Accepted','Uncertain','Dispatched')", (app_id,)).fetchone():
+            meta = client.application(app_id, app['os'])
+            count = db.execute(f'SELECT COUNT(*) FROM targets WHERE app=? AND status IN ({placeholders})', (app_id,*eligible)).fetchone()[0]
+            if not count:
                 continue
-            if self.cfg.mode == 'Bulk':
-                db.execute('CREATE TEMP TABLE IF NOT EXISTS remaining(fid TEXT PRIMARY KEY)')
+            mode = self.cfg.verification_mode
+            if recovery:
+                # A hash may have changed since the crash; filtered hash search
+                # cannot establish that its original file ID is truly absent.
+                mode = 'Bulk'
+            elif mode == 'Auto':
+                mode = 'Selective' if count <= 1000 else 'Bulk'
+            verification_modes[app_id] = mode
+            db.execute('CREATE TEMP TABLE IF NOT EXISTS remaining(fid TEXT PRIMARY KEY, body TEXT)')
+            if mode == 'Bulk':
                 db.execute('DELETE FROM remaining')
                 for row in client.files(app_id):
-                    db.execute('INSERT OR IGNORE INTO remaining VALUES (?)', (str(row['applicationFileId']),))
-                db.execute("UPDATE targets SET status=CASE WHEN fid IN (SELECT fid FROM remaining) THEN 'StillPresent' ELSE 'VerifiedAbsent' END WHERE app=? AND status IN ('Accepted','Uncertain','Dispatched')", (app_id,))
+                    db.execute('INSERT INTO remaining VALUES (?,?)', (str(row['applicationFileId']), json.dumps(row) if recovery else ''))
             else:
+                db.execute('DELETE FROM remaining')
                 def verify(row):
-                    present = any(str(r['applicationFileId']) == row['fid'] for r in client.files(app_id, row['hash']))
-                    return row['fid'], present
-                source_rows = (dict(r) for r in db.execute("SELECT fid,hash FROM targets WHERE app=? AND status IN ('Accepted','Uncertain','Dispatched')", (app_id,)))
-                for fid, present in bounded_map(verify, source_rows, self.cfg.workers):
-                    db.execute('UPDATE targets SET status=? WHERE app=? AND fid=?',
-                               ('StillPresent' if present else 'VerifiedAbsent', app_id, fid))
+                    found = next((r for r in client.files(app_id, row['hash']) if str(r['applicationFileId']) == row['fid']), None)
+                    return row['fid'], found
+                source_rows = (dict(r) for r in db.execute(f'SELECT fid,hash FROM targets WHERE app=? AND status IN ({placeholders})', (app_id,*eligible)))
+                for fid, found in bounded_map(verify, source_rows, self.cfg.workers):
+                    if found:
+                        db.execute('INSERT INTO remaining VALUES (?,?)', (fid, json.dumps(found)))
+            if recovery:
+                for target in db.execute(f'SELECT t.fid,t.hash,r.body FROM targets t JOIN remaining r ON t.fid=r.fid WHERE t.app=? AND t.status IN ({placeholders})', (app_id,*eligible)):
+                    row = json.loads(target['body'])
+                    if target['hash'] not in hashes(row) or (row.get('isHashOnly') is not True and row.get('isHashOnly') not in ('true','True')):
+                        raise SafetyError('Saved target changed hash or rule type; recovery blocked.')
+                    body = dict(row, applicationId=app_id, osType=app['os'], applicationName=meta.get('name',''), organizationId=self.cfg.org)
+                    db.execute('UPDATE targets SET body=? WHERE app=? AND fid=?', (json.dumps(body),app_id,target['fid']))
+            db.execute(f"UPDATE targets SET status=CASE WHEN fid IN (SELECT fid FROM remaining) THEN ? ELSE 'VerifiedAbsent' END WHERE app=? AND status IN ({placeholders})",
+                       ('Planned' if recovery else 'StillPresent',app_id,*eligible))
             db.commit()
-        verified = db.execute("SELECT COUNT(*) FROM targets WHERE status='VerifiedAbsent'").fetchone()[0]
-        planned = db.execute('SELECT COUNT(*) FROM targets').fetchone()[0]
-        complete = verified == planned and total == planned
-        self.update('Complete' if complete else 'Stopped / review required',
-                    'All planned file IDs verified absent.' if complete else 'Some targets remain or were not attempted. Review results; create a new dry run to continue.',
-                    verified=verified, verification_seconds=round(time.perf_counter()-verify_start, 2))
+        self.update(verification_modes=verification_modes)
 
     def export(self):
         with closing(connect(self.path)) as db, (self.directory / 'results.csv').open('w', encoding='utf-8-sig', newline='') as f:

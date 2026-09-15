@@ -40,10 +40,13 @@ with st.sidebar:
     workers = st.slider('Concurrent requests', 1, 16, 6, disabled=busy)
     page_size = st.selectbox('Bulk page size', [100, 1000, 5000, 10000], index=1, disabled=busy)
     timeout = st.slider('Read timeout (seconds)', 10, 120, 60, disabled=busy)
+    batch_size = st.selectbox('Durable logging batch', [1, 64, 256, 512], index=2, disabled=busy)
+    verification_mode = st.selectbox('Verification strategy', ['Auto','Selective','Bulk'], disabled=busy,
+                                     help='Auto uses selective verification for up to 1,000 dispatched records, bulk above that. This is a heuristic, not a measured cost model.')
     st.info('Use Selective for a small subset of a large application. Use Bulk for tens of thousands of hashes. Start with 6 workers.')
     st.caption('Local single-operator app. Do not expose this server publicly. Authorization is never written to run files.')
 
-cfg = Settings(org, token, instance, user_instance, workers, mode, page_size, timeout)
+cfg = Settings(org, token, instance, user_instance, workers, mode, page_size, timeout, batch_size, verification_mode)
 st.subheader('1 · Import your deletion list')
 upload = st.file_uploader('CSV file', type=['csv'], disabled=busy,
                           help='Required: ApplicationId, Hash, OsType. Optional: RecordType. Maximum 512 MB.')
@@ -67,12 +70,27 @@ if st.button('Validate connection & build dry-run preview', type='primary', disa
                 f.write(upload.getbuffer())
             control['job'] = new_job
             control['digest'] = digest
+            control['recovered'] = False
             new_job.start()
         st.rerun()
     except SafetyError as e:
         st.error(str(e))
 
 st.subheader('2 · Review & execute')
+with st.expander('Recover an interrupted v2 run'):
+    st.caption('Enter an existing run directory. Supply the same organization and instance with current authorization. Recovery only reads ThreatLocker; remaining records require a new confirmation.')
+    recovery_path = st.text_input('Existing run directory', disabled=busy)
+    if st.button('Reconcile saved run', disabled=busy or not recovery_path):
+        try:
+            with control['lock']:
+                recovered = Job.restore(cfg, Path(recovery_path))
+                control['job'] = recovered
+                control['digest'] = None
+                control['recovered'] = True
+                recovered.start(recover=True)
+            st.rerun()
+        except (SafetyError, OSError) as e:
+            st.error(str(e))
 st.warning('Live deletion changes application definitions and may affect policy behavior. It is not automatically reversible. This app only deletes exact hash-only records; it never deletes applications or policies.')
 if job and not job.active and job.phase == 'Ready':
     apps, rows = job.preview()
@@ -84,7 +102,7 @@ if job and not job.active and job.phase == 'Ready':
     st.caption('If a hash has multiple exact hash-only records within the named application, all matching record IDs are included. Unmatched hashes are skipped. Preview expires after 30 minutes.')
     required = f"DELETE {snap.get('planned', 0)}"
     confirmation = st.text_input(f'Type {required} to authorize these exact records', key=f'confirm_{job.directory.name}')
-    same = cfg == job.cfg and digest == control['digest']
+    same = cfg == job.cfg and (digest == control['digest'] or control.get('recovered',False))
     if not same:
         st.info('Connection settings or CSV changed. Build a new dry-run preview before executing.')
     if st.button('Execute verified deletion plan', disabled=confirmation != required or not same or not snap.get('planned'), type='primary'):
@@ -133,7 +151,7 @@ def monitor():
                     st.download_button(label, f, file_name=f'{current.directory.name}-{filename}', mime=mime)
         st.caption(f'Local audit directory: {current.directory}')
         if snap['phase'] in ('Failed', 'Stopped / review required'):
-            st.error('Review the audit before retrying. Build a fresh dry run; uncertain POSTs are never automatically replayed.')
+            st.error('Review the audit, then reconcile the saved run or build a fresh dry run. Uncertain POSTs are never blindly replayed.')
 
 
 monitor()
